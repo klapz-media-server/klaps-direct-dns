@@ -8,11 +8,11 @@ use instant_acme::{
 };
 use tracing::info;
 
-/// Charge le compte ACME depuis `account.json`, ou en crée un et le sauvegarde.
-/// Toujours le même compte : Let's Encrypt applique ses limites par compte.
+/// Loads the ACME account from `account.json`, or creates one and saves it.
+/// Always reuse the same account: Let's Encrypt applies some limits per account.
 pub async fn load_or_create_account(path: &Path, directory_url: &str, email: Option<&str>) -> Result<Account> {
     if let Ok(raw) = tokio::fs::read_to_string(path).await {
-        let creds: AccountCredentials = serde_json::from_str(&raw).context("account.json invalide")?;
+        let creds: AccountCredentials = serde_json::from_str(&raw).context("invalid account.json")?;
         return Ok(Account::builder()?.from_credentials(creds).await?);
     }
 
@@ -30,19 +30,19 @@ pub async fn load_or_create_account(path: &Path, directory_url: &str, email: Opt
         tokio::fs::create_dir_all(parent).await?;
     }
     tokio::fs::write(path, serde_json::to_string_pretty(&creds)?).await?;
-    info!("nouveau compte ACME sauvegardé dans {}", path.display());
+    info!("new ACME account saved to {}", path.display());
     Ok(account)
 }
 
-/// Une commande en cours : les TXT à publier avant d'appeler [`finish`].
+/// An order in progress: the TXT records to publish before calling [`finish`].
 pub struct Pending {
     order: Order,
-    /// (nom de l'enregistrement, valeur), ex. ("_acme-challenge.abcd.example.com", "Xy...")
+    /// (record name, value), e.g. ("_acme-challenge.abcd.klapz.direct", "Xy...")
     pub challenges: Vec<(String, String)>,
 }
 
-/// Étape 1 : ouvre la commande et calcule les valeurs TXT (challenge DNS-01).
-/// Pour `x.example.com` + `*.x.example.com`, il y a 2 valeurs sur le même nom.
+/// Step 1: opens the order and computes the TXT values (DNS-01 challenge).
+/// For `x.klapz.direct` + `*.x.klapz.direct` there are 2 values on the same name.
 pub async fn start(account: &Account, names: &[String]) -> Result<Pending> {
     let identifiers: Vec<Identifier> = names.iter().cloned().map(Identifier::Dns).collect();
     let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
@@ -53,15 +53,15 @@ pub async fn start(account: &Account, names: &[String]) -> Result<Pending> {
         let mut authz = authz?;
         match authz.status {
             AuthorizationStatus::Pending => {}
-            AuthorizationStatus::Valid => continue, // déjà validé récemment par LE
-            s => bail!("autorisation dans un état inattendu : {s:?}"),
+            AuthorizationStatus::Valid => continue, // recently validated by LE already
+            s => bail!("authorization in unexpected state: {s:?}"),
         }
         let challenge = authz
             .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| anyhow!("pas de challenge DNS-01 proposé"))?;
-        // Pour *.x.example.com, l'identifiant est x.example.com (sans le "*.").
+            .ok_or_else(|| anyhow!("no DNS-01 challenge offered"))?;
+        // For *.x.klapz.direct the identifier is x.klapz.direct (without the "*.").
         let Identifier::Dns(domain) = challenge.identifier().identifier else {
-            bail!("identifiant non DNS");
+            bail!("non-DNS identifier");
         };
         challenges.push((format!("_acme-challenge.{domain}"), challenge.key_authorization().dns_value()));
     }
@@ -69,8 +69,8 @@ pub async fn start(account: &Account, names: &[String]) -> Result<Pending> {
     Ok(Pending { order, challenges })
 }
 
-/// Étape 2 (une fois les TXT visibles dans le DNS) : valide et récupère le certificat.
-/// Renvoie (chaîne PEM, clé privée PEM).
+/// Step 2 (once the TXT records are visible in DNS): validates and fetches the certificate.
+/// Returns (PEM chain, PEM private key).
 pub async fn finish(mut pending: Pending) -> Result<(String, String)> {
     let order = &mut pending.order;
     let mut authzs = order.authorizations();
@@ -88,9 +88,9 @@ pub async fn finish(mut pending: Pending) -> Result<(String, String)> {
     let retry = RetryPolicy::default().timeout(Duration::from_secs(120));
     let status = order.poll_ready(&retry).await?;
     if status != OrderStatus::Ready {
-        bail!("commande ACME refusée (statut {status:?}) — TXT pas visible ou délai de propagation trop court ?");
+        bail!("ACME order rejected (status {status:?}) — TXT not visible, or propagation delay too short?");
     }
-    // finalize() génère la clé privée (ECDSA P-256) et le CSR.
+    // finalize() generates the private key (ECDSA P-256) and the CSR.
     let key = order.finalize().await?;
     let chain = order.poll_certificate(&retry).await?;
     Ok((chain, key))

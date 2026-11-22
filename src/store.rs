@@ -1,20 +1,20 @@
-//! Stockage hash -> enregistrement binaire, un fichier par hash :
+//! Storage: hash -> binary record, one file per hash:
 //!
 //!   data/certs/ab/cd/abcd1234....bin
 //!
-//! Format (entiers en little-endian) :
+//! Format (little-endian integers):
 //!
-//!   magic      4 octets   "CRT\x01"
-//!   flags      u8         bit 0 = un certificat est présent
-//!   n_txt      u16        nombre de valeurs TXT
-//!   n_txt × { len u16, octets UTF-8 }
-//!   si certificat :
-//!     not_after  i64      expiration (timestamp Unix, secondes)
+//!   magic      4 bytes    "CRT\x01"
+//!   flags      u8         bit 0 = a certificate is present
+//!   n_txt      u16        number of TXT values
+//!   n_txt × { len u16, UTF-8 bytes }
+//!   if certificate:
+//!     not_after  i64      expiry (Unix timestamp, seconds)
 //!     chain      u32 len + PEM
 //!     key        u32 len + PEM
 //!
-//! Le TXT est écrit dès le challenge (avant que le certificat existe), puis le
-//! certificat s'ajoute dans le même fichier.
+//! The TXT values are written as soon as the challenge starts (before the certificate
+//! exists); the certificate is then added to the same file.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -39,10 +39,10 @@ pub struct CertData {
 }
 
 impl CertData {
-    /// L'expiration est lue une seule fois, à l'émission, puis stockée dans le fichier.
+    /// Expiry is parsed once, at issuance, then stored in the file.
     pub fn new(chain: String, key: String) -> Result<Self> {
-        let (_, pem) = parse_x509_pem(chain.as_bytes()).context("PEM invalide")?;
-        let not_after = pem.parse_x509().context("X.509 invalide")?.validity().not_after.timestamp();
+        let (_, pem) = parse_x509_pem(chain.as_bytes()).context("invalid PEM")?;
+        let not_after = pem.parse_x509().context("invalid X.509")?.validity().not_after.timestamp();
         Ok(Self { not_after, chain, key })
     }
 }
@@ -71,7 +71,7 @@ impl Record {
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader(buf);
-        ensure!(r.take(4)? == MAGIC, "magic invalide");
+        ensure!(r.take(4)? == MAGIC, "invalid magic");
         let flags = r.take(1)?[0];
         let n_txt = u16::from_le_bytes(r.array()?);
         let mut txt = Vec::with_capacity(n_txt as usize);
@@ -89,7 +89,7 @@ impl Record {
         } else {
             None
         };
-        ensure!(r.0.is_empty(), "octets en trop à la fin du fichier");
+        ensure!(r.0.is_empty(), "trailing bytes at end of file");
         Ok(Self { txt, cert })
     }
 }
@@ -99,7 +99,7 @@ struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.0.len() < n {
-            bail!("fichier tronqué");
+            bail!("truncated file");
         }
         let (head, tail) = self.0.split_at(n);
         self.0 = tail;
@@ -123,7 +123,7 @@ impl Store {
         Self { root }
     }
 
-    /// `ab/cd/abcd....bin` — le hash doit déjà être validé (hex, ≥ 4 caractères).
+    /// `ab/cd/abcd....bin` — the hash must already be validated (hex, ≥ 4 chars).
     pub fn path(&self, hash: &str) -> PathBuf {
         self.root.join(&hash[0..2]).join(&hash[2..4]).join(format!("{hash}.bin"))
     }
@@ -132,21 +132,21 @@ impl Store {
         write_atomic(self.path(hash), record.encode()).await
     }
 
-    /// Lit l'enregistrement d'un hash sur disque (`None` s'il n'existe pas).
+    /// Reads a hash's record from disk (`None` if it doesn't exist).
     pub async fn get(&self, hash: &str) -> Result<Option<Record>> {
         let path = self.path(hash);
         match tokio::fs::read(&path).await {
             Ok(buf) => Ok(Some(
-                Record::decode(&buf).with_context(|| format!("fichier corrompu : {}", path.display()))?,
+                Record::decode(&buf).with_context(|| format!("corrupted file: {}", path.display()))?,
             )),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("lecture de {}", path.display())),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
 }
 
-/// Écriture atomique : fichier .tmp puis rename. On voit soit l'ancien fichier entier,
-/// soit le nouveau, jamais un fichier à moitié écrit. Mode 0600 : il contient la clé privée.
+/// Atomic write: .tmp file then rename. Readers see either the whole old file or the
+/// whole new one, never a half-written file. Mode 0600: it contains the private key.
 async fn write_atomic(path: PathBuf, content: Vec<u8>) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         use std::io::Write;
@@ -173,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aller_retour_binaire() {
+    fn binary_roundtrip() {
         let only_txt = Record { txt: vec!["abc".into(), "def".into()], cert: None };
         assert_eq!(Record::decode(&only_txt.encode()).unwrap(), only_txt);
 
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ecriture_puis_chargement() {
+    async fn write_then_read() {
         let dir = std::env::temp_dir().join(format!("kdd-test-{}", std::process::id()));
         let store = Store::new(dir.clone());
         let rec = Record { txt: vec!["v".into()], cert: None };

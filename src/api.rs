@@ -38,45 +38,45 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "en-tête Authorization: Bearer <token> manquant"))
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "missing Authorization: Bearer <token> header"))
 }
 
-/// À adapter : vérifie ici que le token existe vraiment chez toi (base, liste, JWT...).
-/// Sans contrôle, n'importe qui peut épuiser tes quotas Let's Encrypt avec des tokens bidons.
+/// TODO: check here that the token really exists on your side (database, allowlist, JWT...).
+/// Without this, anyone can exhaust your Let's Encrypt quota with bogus tokens.
 async fn token_is_valid(_token: &str) -> bool {
     true
 }
 
-/// GET /subdomain : le hash et le domaine du token, sans rien émettre.
+/// GET /subdomain: the token's hash and domain, without issuing anything.
 async fn get_subdomain(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
     let hash = st.hasher.subdomain(bearer(&headers)?);
     Ok(Json(json!({ "domain": st.domain(&hash), "hash": hash })).into_response())
 }
 
-/// POST /certificate : le certificat stocké pour ce hash, ou un nouveau s'il manque ou expire bientôt.
+/// POST /certificate: the stored certificate for this hash, or a new one if missing or expiring soon.
 async fn post_certificate(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Result<Response, ApiError> {
     let token = bearer(&headers)?;
     if !token_is_valid(token).await {
-        return Err(ApiError(StatusCode::FORBIDDEN, "token invalide"));
+        return Err(ApiError(StatusCode::FORBIDDEN, "invalid token"));
     }
     let hash = st.hasher.subdomain(token);
     match st.certificate(&hash).await {
         Ok(body) => Ok(json_bytes(body)),
         Err(e) => {
-            error!("échec pour {hash} : {e:#}");
-            Err(ApiError(StatusCode::BAD_GATEWAY, "impossible d'obtenir le certificat"))
+            error!("certificate failed for {hash}: {e:#}");
+            Err(ApiError(StatusCode::BAD_GATEWAY, "could not obtain certificate"))
         }
     }
 }
 
-/// GET /txt/{hash} : les valeurs TXT `_acme-challenge` stockées (publiques de toute façon via le DNS).
+/// GET /txt/{hash}: the stored `_acme-challenge` TXT values (public anyway via DNS).
 async fn get_txt(State(st): State<Arc<AppState>>, Path(hash): Path<String>) -> Result<Response, ApiError> {
     if !st.hasher.is_valid(&hash) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "hash invalide"));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid hash"));
     }
     let entry = st.get(&hash).await.ok().filter(|e| !e.record.txt.is_empty());
     let Some(entry) = entry else {
-        return Err(ApiError(StatusCode::NOT_FOUND, "aucun TXT pour ce hash"));
+        return Err(ApiError(StatusCode::NOT_FOUND, "no TXT for this hash"));
     };
     Ok(Json(json!({
         "name": format!("_acme-challenge.{}", st.domain(&hash)),

@@ -1,4 +1,4 @@
 /target
-# Contient les clés privées des certificats et du compte ACME : ne jamais committer.
+# Holds certificate and ACME account private keys: never commit.
 /data
 .env

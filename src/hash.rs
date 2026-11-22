@@ -1,14 +1,14 @@
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-/// Générateur de sous-domaine déterministe : HMAC-SHA256(secret, token), en hex, tronqué.
+/// Deterministic subdomain generator: HMAC-SHA256(secret, token), hex-encoded, truncated.
 ///
-/// Le même token donne toujours le même hash, mais sans le secret on ne peut ni le deviner
-/// ni remonter au token. C'est important parce que chaque certificat est publié dans les
-/// logs Certificate Transparency : le sous-domaine devient public.
+/// The same token always yields the same hash, but without the secret it can neither be
+/// guessed nor traced back to the token. This matters because every issued certificate is
+/// published in Certificate Transparency logs: the subdomain becomes public.
 ///
-/// Perf : l'état HMAC avec la clé est préparé une seule fois au démarrage ; chaque requête
-/// ne fait qu'un clone (quelques octets) au lieu de re-hasher la clé.
+/// Perf: the keyed HMAC state is prepared once at startup; each request only clones it
+/// (a few bytes) instead of re-hashing the key.
 #[derive(Clone)]
 pub struct Hasher {
     keyed: Hmac<Sha256>,
@@ -17,8 +17,8 @@ pub struct Hasher {
 
 impl Hasher {
     pub fn new(secret: &[u8], len: usize) -> Self {
-        let keyed = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepte toute taille de clé");
-        // 4 caractères minimum pour le découpage en dossiers ab/cd/, 63 max (label DNS).
+        let keyed = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts keys of any size");
+        // At least 4 chars for the ab/cd/ directory sharding, at most 63 (DNS label limit).
         Self { keyed, len: len.clamp(8, 63) }
     }
 
@@ -30,8 +30,8 @@ impl Hasher {
         h
     }
 
-    /// Vérifie qu'une chaîne venant de l'extérieur a bien la forme d'un hash
-    /// (protège aussi contre les `../` dans les chemins).
+    /// Checks that an externally supplied string looks like a hash
+    /// (also guards against `../` in file paths).
     pub fn is_valid(&self, s: &str) -> bool {
         s.len() == self.len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
@@ -42,12 +42,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deterministe_et_dependant_du_secret() {
+    fn deterministic_and_secret_dependent() {
         let h = Hasher::new(b"secret", 20);
-        let a = h.subdomain("mon-token");
-        assert_eq!(a, h.subdomain("mon-token"));
-        assert_ne!(a, Hasher::new(b"autre", 20).subdomain("mon-token"));
-        assert_ne!(a, h.subdomain("autre-token"));
+        let a = h.subdomain("my-token");
+        assert_eq!(a, h.subdomain("my-token"));
+        assert_ne!(a, Hasher::new(b"other", 20).subdomain("my-token"));
+        assert_ne!(a, h.subdomain("other-token"));
         assert_eq!(a.len(), 20);
         assert!(h.is_valid(&a));
         assert!(!h.is_valid("../../etc/passwd000"));

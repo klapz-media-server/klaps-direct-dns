@@ -1,16 +1,16 @@
-//! Serveur DNS faisant autorité sur `BASE_DOMAIN` (ex. klapz.direct). Tout est calculé
-//! à la volée, sans rien stocker, sauf les TXT ACME :
+//! Authoritative DNS server for `BASE_DOMAIN` (e.g. klapz.direct). Everything is computed
+//! on the fly, nothing stored, except the ACME TXT values:
 //!
 //!   192-168-1-12.<hash>.klapz.direct          A     192.168.1.12
 //!   2001-db8--1.<hash>.klapz.direct           AAAA  2001:db8::1      ('-' = ':', '--' = '::')
-//!   _acme-challenge.<hash>.klapz.direct       TXT   valeurs stockées (cache RAM / .bin)
+//!   _acme-challenge.<hash>.klapz.direct       TXT   stored values (RAM cache / .bin)
 //!   klapz.direct                              SOA, NS
-//!   ns1.klapz.direct                          A/AAAA (glue, depuis la config)
+//!   ns1.klapz.direct                          A/AAAA (glue, from config)
 //!
-//! Perf : UDP sur N sockets en SO_REUSEPORT (un par cœur, le noyau répartit les paquets),
-//! réponses A/AAAA sans aucune allocation de stockage ni accès disque. Seules les requêtes
-//! TXT partent dans une tâche à part (elles peuvent lire le disque si le cache est froid).
-//! TCP est géré aussi (obligatoire si une réponse ne tient pas en UDP).
+//! Perf: UDP on N SO_REUSEPORT sockets (one per core, the kernel spreads packets across
+//! them); A/AAAA answers involve no storage lookup and no disk access. Only TXT queries are
+//! spawned onto a separate task (they may read the disk when the cache is cold).
+//! TCP is supported too (required when a response doesn't fit in UDP).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -26,29 +26,29 @@ use tracing::{info, warn};
 
 use crate::state::AppState;
 
-const TTL_IP: u32 = 86_400; // une IP encodée dans le nom ne change jamais
-const TTL_TXT: u32 = 1; // les challenges changent à chaque émission
+const TTL_IP: u32 = 86_400; // an IP encoded in the name never changes
+const TTL_TXT: u32 = 1; // challenges change on every issuance
 const TTL_ZONE: u32 = 3_600;
-const NEG_TTL: u32 = 60; // cache négatif (SOA minimum)
-const EDNS_PAYLOAD: u16 = 1232; // taille recommandée (DNS flag day 2020)
+const NEG_TTL: u32 = 60; // negative caching (SOA minimum)
+const EDNS_PAYLOAD: u16 = 1232; // recommended size (DNS flag day 2020)
 
 pub struct DnsConfig {
     pub listen: SocketAddr,
-    /// Serveurs de noms de la zone, ex. ["ns1.klapz.direct"].
+    /// Zone name servers, e.g. ["ns1.klapz.direct"].
     pub ns: Vec<String>,
-    /// IP de chaque serveur de noms (même ordre), pour la glue.
+    /// IP of each name server (same order), for glue records.
     pub ns_ips: Vec<IpAddr>,
 }
 
-/// Enregistrements fixes de la zone, construits une seule fois au démarrage.
+/// Static zone records, built once at startup.
 struct Zone {
     state: Arc<AppState>,
     base: String,
     soa: Record,
     ns: Vec<Record>,
-    /// Noms des NS en minuscules, sans point final.
+    /// NS host names, lowercase, no trailing dot.
     ns_names: Vec<String>,
-    /// (nom en minuscules sans point final, IP)
+    /// (lowercase name without trailing dot, IP)
     glue: Vec<(String, IpAddr)>,
 }
 
@@ -81,14 +81,14 @@ pub async fn serve(state: Arc<AppState>, cfg: DnsConfig) -> Result<()> {
     let glue = ns_names.iter().cloned().zip(cfg.ns_ips.iter().copied()).collect();
     let zone = Arc::new(Zone { state, base, soa, ns, ns_names, glue });
 
-    // Un socket UDP par cœur, tous sur le même port grâce à SO_REUSEPORT.
+    // One UDP socket per core, all on the same port thanks to SO_REUSEPORT.
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     for _ in 0..workers {
         let sock = Arc::new(UdpSocket::from_std(reuseport_udp(cfg.listen)?)?);
         tokio::spawn(udp_loop(zone.clone(), sock));
     }
     let tcp = TcpListener::bind(cfg.listen).await.with_context(|| format!("bind TCP {}", cfg.listen))?;
-    info!("DNS sur {} (UDP ×{workers}, TCP) pour {}", cfg.listen, zone.base);
+    info!("DNS listening on {} (UDP ×{workers}, TCP) for {}", cfg.listen, zone.base);
     tcp_loop(zone, tcp).await
 }
 
@@ -98,7 +98,7 @@ fn reuseport_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     sock.set_reuse_port(true)?;
     sock.set_nonblocking(true)?;
     let _ = sock.set_recv_buffer_size(4 << 20);
-    sock.bind(&addr.into()).with_context(|| format!("bind UDP {addr} (port 53 : root ou CAP_NET_BIND_SERVICE)"))?;
+    sock.bind(&addr.into()).with_context(|| format!("bind UDP {addr} (port 53 needs root or CAP_NET_BIND_SERVICE)"))?;
     Ok(sock.into())
 }
 
@@ -108,14 +108,14 @@ async fn udp_loop(zone: Arc<Zone>, sock: Arc<UdpSocket>) {
         let (len, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                warn!("recv UDP : {e}");
+                warn!("UDP recv: {e}");
                 continue;
             }
         };
-        let Ok(req) = Message::from_vec(&buf[..len]) else { continue }; // paquet illisible : ignoré
+        let Ok(req) = Message::from_vec(&buf[..len]) else { continue }; // unparseable packet: ignored
         let is_txt = req.queries.first().is_some_and(|q| matches!(q.query_type(), RecordType::TXT | RecordType::ANY));
         if is_txt {
-            // Peut lire le disque : on ne bloque pas la boucle.
+            // May read the disk: don't block the loop.
             let (zone, sock) = (zone.clone(), sock.clone());
             tokio::spawn(async move {
                 if let Some(out) = zone.respond(&req, true).await {
@@ -135,7 +135,7 @@ async fn tcp_loop(zone: Arc<Zone>, listener: TcpListener) -> Result<()> {
         tokio::spawn(async move {
             let _ = stream.set_nodelay(true);
             let mut buf = vec![0u8; 65_535];
-            // Messages préfixés par leur longueur (u16), plusieurs possibles par connexion.
+            // Length-prefixed (u16) messages, possibly several per connection.
             loop {
                 let len = match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_u16()).await {
                     Ok(Ok(l)) => l as usize,
@@ -160,7 +160,7 @@ async fn tcp_loop(zone: Arc<Zone>, listener: TcpListener) -> Result<()> {
 impl Zone {
     async fn respond(&self, req: &Message, udp: bool) -> Option<Vec<u8>> {
         if req.metadata.message_type != MessageType::Query {
-            return None; // on ne répond jamais à une réponse
+            return None; // never answer a response
         }
         let mut resp = Message::response(req.metadata.id, req.metadata.op_code);
         resp.metadata.authoritative = true;
@@ -180,7 +180,7 @@ impl Zone {
 
         match self.resolve(&query).await {
             Answer::Records(records) => {
-                // Glue : les IP des NS en section additionnelle.
+                // Glue: name server IPs in the additional section.
                 if query.query_type() == RecordType::NS {
                     for rec in self.glue_records() {
                         resp.add_additional(rec);
@@ -210,13 +210,13 @@ impl Zone {
 
     async fn resolve(&self, q: &Query) -> Answer {
         let qtype = q.query_type();
-        // On répond avec le nom exact de la question (casse comprise : certains
-        // résolveurs randomisent la casse, technique « 0x20 », et vérifient l'écho).
+        // Answer with the exact question name, case included: some resolvers randomize
+        // the case ("0x20" technique) and check that it is echoed back.
         let qname = q.name();
         let lower = qname.to_ascii().to_ascii_lowercase();
         let name = lower.strip_suffix('.').unwrap_or(&lower);
 
-        // Apex : klapz.direct
+        // Apex: klapz.direct
         if name == self.base {
             return match qtype {
                 RecordType::SOA => Answer::Records(vec![self.soa.clone()]),
@@ -225,10 +225,10 @@ impl Zone {
             };
         }
         let Some(rel) = name.strip_suffix(self.base.as_str()).and_then(|r| r.strip_suffix('.')) else {
-            return Answer::Refused; // hors de notre zone
+            return Answer::Refused; // outside our zone
         };
 
-        // Serveurs de noms : ns1.klapz.direct
+        // Name servers: ns1.klapz.direct
         if self.ns_names.iter().any(|n| n == name) {
             let recs: Vec<_> = self
                 .glue
@@ -239,7 +239,7 @@ impl Zone {
             return if recs.is_empty() { Answer::NoData } else { Answer::Records(recs) };
         }
 
-        // <label>.<hash> ou <hash>
+        // <label>.<hash> or <hash>
         let (label, hash) = match rel.rsplit_once('.') {
             Some((label, hash)) => (Some(label), hash),
             None => (None, rel),
@@ -248,7 +248,7 @@ impl Zone {
             return Answer::NxDomain;
         }
         let Some(label) = label else {
-            return Answer::NoData; // <hash>.klapz.direct existe mais n'a pas d'enregistrement
+            return Answer::NoData; // <hash>.klapz.direct exists but has no records
         };
 
         if label == "_acme-challenge" {
@@ -258,14 +258,14 @@ impl Zone {
             let values = match self.state.get(hash).await {
                 Ok(e) => e.record.txt.clone(),
                 Err(e) => {
-                    warn!("lecture TXT {hash} : {e:#}");
+                    warn!("TXT read for {hash}: {e:#}");
                     return Answer::NoData;
                 }
             };
             if values.is_empty() {
                 return Answer::NoData;
             }
-            // Un enregistrement TXT par valeur (2 si certificat wildcard + domaine nu).
+            // One TXT record per value (2 for a wildcard + bare-domain certificate).
             return Answer::Records(
                 values.into_iter().map(|v| Record::from_rdata(qname.clone(), TTL_TXT, RData::TXT(TXT::new(vec![v])))).collect(),
             );
@@ -295,13 +295,13 @@ pub fn parse_ip_label(label: &str) -> Option<IpAddr> {
     if label.is_empty() || label.len() > 63 || label.contains('.') {
         return None;
     }
-    // IPv4 : exactement 4 nombres séparés par des tirets.
+    // IPv4: exactly 4 numbers separated by dashes.
     if label.bytes().all(|b| b.is_ascii_digit() || b == b'-') && label.bytes().filter(|&b| b == b'-').count() == 3 {
         if let Ok(v4) = label.replace('-', ".").parse::<Ipv4Addr>() {
             return Some(IpAddr::V4(v4));
         }
     }
-    // IPv6 : hex et tirets ; « -- » devient « :: » via le remplacement simple.
+    // IPv6: hex digits and dashes; "--" becomes "::" through the plain replacement.
     if label.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') && label.contains('-') {
         if let Ok(v6) = label.replace('-', ":").parse::<Ipv6Addr>() {
             return Some(IpAddr::V6(v6));
@@ -310,8 +310,8 @@ pub fn parse_ip_label(label: &str) -> Option<IpAddr> {
     None
 }
 
-/// Sérialise la réponse ; en UDP, tronque (bit TC) si elle dépasse ce que le client accepte,
-/// le client refera alors la requête en TCP.
+/// Serializes the response; over UDP, truncates it (TC bit) if it exceeds what the client
+/// accepts, so the client retries over TCP.
 fn finish(mut resp: Message, code: ResponseCode, udp: bool, req: &Message) -> Option<Vec<u8>> {
     resp.metadata.response_code = code;
     let out = resp.to_vec().ok()?;
@@ -329,7 +329,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodage_ip() {
+    fn ip_label_decoding() {
         assert_eq!(parse_ip_label("192-168-1-12"), Some("192.168.1.12".parse().unwrap()));
         assert_eq!(parse_ip_label("10-0-0-1"), Some("10.0.0.1".parse().unwrap()));
         assert_eq!(parse_ip_label("2001-db8--1"), Some("2001:db8::1".parse().unwrap()));

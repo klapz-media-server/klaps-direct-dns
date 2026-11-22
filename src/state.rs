@@ -1,10 +1,9 @@
-//! État partagé entre l'API et le serveur DNS.
+//! State shared between the API and the DNS server.
 //!
-//! Disque = source de vérité (un `.bin` par hash). Devant, un cache RAM borné en octets
-//! (50 Mo par défaut) : moka évince selon l'usage (TinyLFU : fréquence + récence), donc
-//! les hash les plus demandés restent en mémoire. Les hash absents sont aussi mis en cache
-//! (entrée vide, quelques octets) pour que des requêtes DNS sur des noms bidons ne
-//! touchent pas le disque à chaque fois.
+//! Disk is the source of truth (one `.bin` per hash). In front of it sits a RAM cache
+//! bounded in bytes (50 MB by default): moka evicts based on usage (TinyLFU: frequency +
+//! recency), so the most requested hashes stay in memory. Missing hashes are cached too
+//! (empty entry, a few bytes) so DNS queries for bogus names don't hit the disk every time.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +21,7 @@ use crate::hash::Hasher;
 use crate::store::{CertData, Record, Store};
 
 pub struct Config {
-    /// En minuscules, sans point final, ex. "certs.example.com".
+    /// Lowercase, no trailing dot, e.g. "klapz.direct".
     pub base_domain: String,
     pub wildcard: bool,
     pub directory_url: String,
@@ -33,17 +32,17 @@ pub struct Config {
     pub cache_max_bytes: u64,
 }
 
-/// Ce qu'on garde en mémoire pour un hash. La réponse JSON du certificat est
-/// sérialisée une seule fois, puis renvoyée telle quelle (clone d'un `Bytes` = compteur).
+/// What we keep in memory for a hash. The certificate JSON response is serialized once,
+/// then served as-is (cloning a `Bytes` is just a refcount bump).
 pub struct Entry {
     pub record: Record,
     pub cert_json: Option<Bytes>,
 }
 
 impl Entry {
-    /// Poids approximatif en RAM, pour la limite du cache.
+    /// Approximate RAM footprint, for the cache size limit.
     fn weight(&self, key: &str) -> u32 {
-        const OVERHEAD: usize = 256; // structures internes du cache, Arc, Vec...
+        const OVERHEAD: usize = 256; // cache internals, Arc, Vec...
         let txt: usize = self.record.txt.iter().map(|t| t.len() + 24).sum();
         let cert = self.record.cert.as_ref().map_or(0, |c| c.chain.len() + c.key.len());
         let json = self.cert_json.as_ref().map_or(0, Bytes::len);
@@ -57,8 +56,8 @@ pub struct AppState {
     store: Store,
     cloudflare: Option<Cloudflare>,
     cache: Cache<String, Arc<Entry>>,
-    /// Un verrou par émission en cours : deux requêtes simultanées pour le même token
-    /// ne déclenchent qu'une seule commande Let's Encrypt. Purgé quand l'émission se termine.
+    /// One lock per in-flight issuance: two concurrent requests for the same token only
+    /// trigger a single Let's Encrypt order. Removed once the issuance completes.
     issuing: Cache<String, Arc<Mutex<()>>>,
     account: OnceCell<instant_acme::Account>,
 }
@@ -73,7 +72,7 @@ impl AppState {
             .max_capacity(cfg.cache_max_bytes)
             .weigher(|k: &String, v: &Arc<Entry>| v.weight(k))
             .build();
-        info!("cache RAM : {} Mo max", cfg.cache_max_bytes / 1_000_000);
+        info!("RAM cache: {} MB max", cfg.cache_max_bytes / 1_000_000);
         Self {
             store: Store::new(cfg.data_dir.join("certs")),
             cfg,
@@ -108,13 +107,13 @@ impl AppState {
                 "certificate": c.chain,
                 "private_key": c.key,
             });
-            Bytes::from(serde_json::to_vec(&body).expect("JSON toujours sérialisable"))
+            Bytes::from(serde_json::to_vec(&body).expect("JSON is always serializable"))
         });
         Arc::new(Entry { record, cert_json })
     }
 
-    /// Entrée d'un hash (déjà validé) : depuis la RAM, sinon depuis le disque.
-    /// Si plusieurs requêtes ratent le cache en même temps, une seule lit le disque.
+    /// Entry for an (already validated) hash: from RAM, otherwise from disk.
+    /// If several requests miss the cache at once, only one reads the disk.
     pub async fn get(&self, hash: &str) -> Result<Arc<Entry>> {
         self.cache
             .try_get_with_by_ref(hash, async {
@@ -125,9 +124,9 @@ impl AppState {
             .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
-    /// Pour le serveur DNS : `_acme-challenge.<hash>.<base_domain>` -> entrée (lire `record.txt`).
-    /// Insensible à la casse, accepte le point final.
-    #[allow(dead_code)] // pratique pour un autre frontal DNS ; dns.rs résout directement
+    /// For a DNS frontend: `_acme-challenge.<hash>.<base_domain>` -> entry (read `record.txt`).
+    /// Case-insensitive, accepts a trailing dot.
+    #[allow(dead_code)] // handy for another DNS frontend; dns.rs resolves names itself
     pub async fn txt_for_name(&self, qname: &str) -> Option<Arc<Entry>> {
         let qname = qname.strip_suffix('.').unwrap_or(qname);
         let lower;
@@ -152,7 +151,7 @@ impl AppState {
             .flatten()
     }
 
-    /// Met à jour la RAM tout de suite (le DNS voit le changement immédiatement), puis le disque.
+    /// Updates RAM first (DNS sees the change immediately), then disk.
     async fn save(&self, hash: &str, record: Record) -> Result<Arc<Entry>> {
         let entry = self.build_entry(hash, record);
         self.cache.insert(hash.to_owned(), entry.clone()).await;
@@ -169,9 +168,9 @@ impl AppState {
             .await
     }
 
-    /// Renvoie la réponse JSON du certificat pour ce hash, en l'émettant si besoin.
+    /// Returns the certificate JSON response for this hash, issuing it if needed.
     pub async fn certificate(&self, hash: &str) -> Result<Bytes> {
-        // Chemin rapide : en cache (ou sur disque) et encore valide.
+        // Fast path: cached (or on disk) and still valid.
         if let Some(body) = self.fresh(&*self.get(hash).await?) {
             return Ok(body);
         }
@@ -186,12 +185,12 @@ impl AppState {
     async fn issue(&self, hash: &str) -> Result<Bytes> {
         let current = self.get(hash).await?;
         if let Some(body) = self.fresh(&current) {
-            return Ok(body); // une autre requête vient de l'émettre pendant qu'on attendait le verrou
+            return Ok(body); // another request issued it while we were waiting for the lock
         }
         let mut record = current.record.clone();
 
         let names = self.names(hash);
-        info!("émission d'un certificat pour {names:?}");
+        info!("issuing certificate for {names:?}");
         let pending = acme::start(self.account().await?, &names).await?;
 
         let mut cf_ids = Vec::new();
@@ -214,7 +213,7 @@ impl AppState {
         if let Some(cf) = &self.cloudflare {
             for id in cf_ids {
                 if let Err(e) = cf.delete_record(&id).await {
-                    warn!("suppression du TXT Cloudflare {id} impossible : {e:#}");
+                    warn!("could not delete Cloudflare TXT {id}: {e:#}");
                 }
             }
         }
@@ -222,7 +221,7 @@ impl AppState {
         let (chain, key) = result?;
         record.cert = Some(CertData::new(chain, key)?);
         let entry = self.save(hash, record).await?;
-        Ok(entry.cert_json.clone().expect("le certificat vient d'être ajouté"))
+        Ok(entry.cert_json.clone().expect("certificate was just added"))
     }
 }
 
@@ -232,7 +231,7 @@ mod tests {
 
     fn state(dir: &std::path::Path) -> AppState {
         let cfg = Config {
-            base_domain: "certs.example.com".into(),
+            base_domain: "klapz.direct".into(),
             wildcard: true,
             directory_url: String::new(),
             email: None,
@@ -245,38 +244,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn txt_et_certificat_depuis_le_disque() {
+    async fn txt_and_certificate_from_disk() {
         let dir = std::env::temp_dir().join(format!("kdd-state-{}", std::process::id()));
         let st = state(&dir);
-        let hash = st.hasher.subdomain("mon-token");
+        let hash = st.hasher.subdomain("my-token");
 
-        // Nom inconnu : rien (et l'absence est mise en cache).
-        assert!(st.txt_for_name(&format!("_acme-challenge.{hash}.certs.example.com.")).await.is_none());
+        // Unknown name: nothing (and the miss is cached).
+        assert!(st.txt_for_name(&format!("_acme-challenge.{hash}.klapz.direct.")).await.is_none());
 
-        // On écrit un enregistrement sur disque, comme après une émission.
+        // Write a record, as after an issuance.
         let rec = Record {
-            txt: vec!["valeur-txt".into()],
+            txt: vec!["txt-value".into()],
             cert: Some(CertData { not_after: now() + 60 * 86_400, chain: "CHAIN".into(), key: "KEY".into() }),
         };
         st.save(&hash, rec).await.unwrap();
 
-        let e = st.txt_for_name(&format!("_ACME-challenge.{}.Certs.Example.com.", hash.to_uppercase())).await.unwrap();
-        assert_eq!(e.record.txt, vec!["valeur-txt".to_string()]);
-        assert!(st.txt_for_name("_acme-challenge.zzz.certs.example.com").await.is_none());
-        assert!(st.txt_for_name(&format!("_acme-challenge.{hash}.autre.com")).await.is_none());
+        let e = st.txt_for_name(&format!("_ACME-challenge.{}.Klapz.Direct.", hash.to_uppercase())).await.unwrap();
+        assert_eq!(e.record.txt, vec!["txt-value".to_string()]);
+        assert!(st.txt_for_name("_acme-challenge.zzz.klapz.direct").await.is_none());
+        assert!(st.txt_for_name(&format!("_acme-challenge.{hash}.other.com")).await.is_none());
 
-        // Cache vidé : relu depuis le .bin, et le certificat encore valide est renvoyé sans ACME.
+        // Cache cleared: re-read from the .bin, and the still-valid certificate is returned without ACME.
         st.cache.invalidate_all();
         let body = st.certificate(&hash).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["certificate"], "CHAIN");
-        assert_eq!(json["names"][0], format!("*.{hash}.certs.example.com"));
+        assert_eq!(json["names"][0], format!("*.{hash}.klapz.direct"));
 
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
-    async fn cache_borne_en_octets() {
+    async fn cache_bounded_in_bytes() {
         let dir = std::env::temp_dir().join(format!("kdd-cache-{}", std::process::id()));
         let mut st = state(&dir);
         st.cache = Cache::builder()
@@ -289,7 +288,7 @@ mod tests {
             st.cache.insert(format!("{i:020}"), st.build_entry("h", rec)).await;
         }
         st.cache.run_pending_tasks().await;
-        assert!(st.cache.weighted_size() <= 1_000_000, "taille = {}", st.cache.weighted_size());
+        assert!(st.cache.weighted_size() <= 1_000_000, "size = {}", st.cache.weighted_size());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

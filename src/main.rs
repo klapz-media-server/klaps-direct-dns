@@ -21,7 +21,7 @@ use crate::state::{AppState, Config};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn env(key: &str) -> Result<String> {
-    std::env::var(key).with_context(|| format!("variable d'environnement {key} manquante"))
+    std::env::var(key).with_context(|| format!("missing environment variable {key}"))
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -35,11 +35,11 @@ async fn main() -> Result<()> {
     let directory_url = match env_or("ACME_DIRECTORY", "staging").as_str() {
         "production" => instant_acme::LetsEncrypt::Production.url().to_owned(),
         "staging" => instant_acme::LetsEncrypt::Staging.url().to_owned(),
-        other => other.to_owned(), // URL d'un autre serveur ACME
+        other => other.to_owned(), // URL of another ACME server
     };
 
-    // Cloudflare est optionnel : sans lui, c'est ton serveur DNS qui sert les TXT
-    // (via AppState::txt_for_name), et il n'y a aucun délai de propagation.
+    // Cloudflare is optional: without it, the built-in DNS server serves the TXT records
+    // straight from memory, with no propagation delay.
     let cloudflare = match (std::env::var("CLOUDFLARE_API_TOKEN"), std::env::var("CLOUDFLARE_ZONE_ID")) {
         (Ok(token), Ok(zone)) if !token.is_empty() && !zone.is_empty() => Some(Cloudflare::new(token, zone)),
         _ => None,
@@ -58,28 +58,28 @@ async fn main() -> Result<()> {
     };
     let hasher = Hasher::new(env("HASH_SECRET")?.as_bytes(), env_or("HASH_LENGTH", "20").parse()?);
 
-    info!("ACME : {} | Cloudflare : {}", cfg.directory_url, if cloudflare.is_some() { "oui" } else { "non" });
+    info!("ACME: {} | Cloudflare: {}", cfg.directory_url, if cloudflare.is_some() { "yes" } else { "no" });
     let state = Arc::new(AppState::new(cfg, hasher, cloudflare));
 
-    // Serveur DNS dans le même process : il lit le même cache, donc un TXT écrit
-    // par l'API est servi immédiatement. DNS_LISTEN=off pour le désactiver.
+    // DNS server in the same process: it reads the same cache, so a TXT written by the
+    // API is served immediately. Set DNS_LISTEN=off to disable it.
     let dns_listen = env_or("DNS_LISTEN", "0.0.0.0:53");
     if dns_listen != "off" {
         let base = &state.cfg.base_domain;
         let dns_cfg = dns::DnsConfig {
-            listen: dns_listen.parse().context("DNS_LISTEN invalide")?,
+            listen: dns_listen.parse().context("invalid DNS_LISTEN")?,
             ns: env_or("DNS_NS", &format!("ns1.{base}")).split(',').map(|s| s.trim().to_owned()).collect(),
             ns_ips: env_or("DNS_NS_IPS", "")
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().parse())
                 .collect::<Result<_, _>>()
-                .context("DNS_NS_IPS invalide")?,
+                .context("invalid DNS_NS_IPS")?,
         };
         let st = state.clone();
         tokio::spawn(async move {
             if let Err(e) = dns::serve(st, dns_cfg).await {
-                tracing::error!("serveur DNS arrêté : {e:#}");
+                tracing::error!("DNS server stopped: {e:#}");
                 std::process::exit(1);
             }
         });
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
 
     let addr = env_or("LISTEN_ADDR", "0.0.0.0:8080");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("API sur {addr}");
+    info!("API listening on {addr}");
     axum::serve(listener, api::router(state)).await?;
     Ok(())
 }
