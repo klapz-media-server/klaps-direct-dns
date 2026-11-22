@@ -1,0 +1,4 @@
+/target
+# Contient les clés privées des certificats et du compte ACME : ne jamais committer.
+/data
+.env
