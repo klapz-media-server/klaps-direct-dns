@@ -15,16 +15,17 @@ A single Rust binary that does two things:
 
 ## Flow
 
-1. `POST /certificate` with `Authorization: Bearer <token>`.
+1. `PUT /certificate` with `Authorization: Bearer <token>`. The token must be exactly `TOKEN_LENGTH` characters long (32 by default), otherwise the API answers `400`.
 2. `hash = HMAC-SHA256(HASH_SECRET, token)`, truncated to `HASH_LENGTH` hex chars.
 3. If `data/certs/ab/cd/<hash>.bin` holds a certificate valid for more than `RENEW_BEFORE_DAYS` days, it is returned right away.
-4. Otherwise: ACME order, TXT value written to the `.bin` and to RAM (the DNS server serves it immediately), validation, then the certificate and key are added to the `.bin` and returned.
+4. If it expires within `RENEW_BEFORE_DAYS`, a refresh is attempted. If the refresh fails while the current certificate is still valid, the current one is returned and no new attempt is made for an hour.
+5. If there is no certificate yet: ACME order, TXT value written to the `.bin` and to RAM (the DNS server serves it immediately), validation, then the certificate and key are added to the `.bin` and returned.
 
 ## API
 
 ```
 GET  /subdomain        (Bearer)  -> {"hash","domain"}
-POST /certificate      (Bearer)  -> {"hash","domain","names","not_after","certificate","private_key"}
+PUT  /certificate      (Bearer)  -> {"hash","domain","names","not_after","certificate","private_key"}  (same body whether issued, refreshed or stored)
 GET  /txt/{hash}                 -> {"name","values"}
 ```
 

@@ -30,6 +30,8 @@ pub struct Config {
     pub renew_before: Duration,
     pub propagation_delay: Duration,
     pub cache_max_bytes: u64,
+    /// Exact number of characters a token must have.
+    pub token_length: usize,
 }
 
 /// What we keep in memory for a hash. The certificate JSON response is serialized once,
@@ -59,8 +61,13 @@ pub struct AppState {
     /// One lock per in-flight issuance: two concurrent requests for the same token only
     /// trigger a single Let's Encrypt order. Removed once the issuance completes.
     issuing: Cache<String, Arc<Mutex<()>>>,
+    /// Hashes whose refresh recently failed: no new attempt for an hour, the still-valid
+    /// certificate is served instead (avoids burning Let's Encrypt quotas in a loop).
+    refresh_backoff: Cache<String, ()>,
     account: OnceCell<instant_acme::Account>,
 }
+
+const REFRESH_BACKOFF: Duration = Duration::from_secs(3_600);
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
@@ -80,6 +87,7 @@ impl AppState {
             cloudflare,
             cache,
             issuing: Cache::builder().time_to_idle(Duration::from_secs(600)).build(),
+            refresh_backoff: Cache::builder().time_to_live(REFRESH_BACKOFF).build(),
             account: OnceCell::new(),
         }
     }
@@ -168,18 +176,45 @@ impl AppState {
             .await
     }
 
-    /// Returns the certificate JSON response for this hash, issuing it if needed.
+    /// Still valid (even if close to expiry): usable as a fallback when a refresh fails.
+    fn not_expired(&self, entry: &Entry) -> Option<Bytes> {
+        let cert = entry.record.cert.as_ref()?;
+        (cert.not_after > now()).then(|| entry.cert_json.clone()).flatten()
+    }
+
+    /// Returns the certificate JSON response for this hash (same body whether it was just
+    /// issued, refreshed or already stored):
+    /// - none stored: issue one;
+    /// - stored and far from expiry: return it;
+    /// - stored and close to expiry: try to refresh; if that fails while the old one is still
+    ///   valid, return the old one and wait `REFRESH_BACKOFF` before trying again.
     pub async fn certificate(&self, hash: &str) -> Result<Bytes> {
-        // Fast path: cached (or on disk) and still valid.
-        if let Some(body) = self.fresh(&*self.get(hash).await?) {
+        let current = self.get(hash).await?;
+        // Fast path: cached (or on disk) and far from expiry.
+        if let Some(body) = self.fresh(&current) {
             return Ok(body);
+        }
+        let fallback = self.not_expired(&current);
+        if let Some(body) = &fallback {
+            if self.refresh_backoff.contains_key(hash) {
+                return Ok(body.clone());
+            }
         }
 
         let lock = self.issuing.get_with_by_ref(hash, async { Arc::default() }).await;
         let _guard = lock.lock().await;
         let result = self.issue(hash).await;
         self.issuing.invalidate(hash).await;
-        result
+
+        match (result, fallback) {
+            (Ok(body), _) => Ok(body),
+            (Err(e), Some(old)) => {
+                warn!("refresh failed for {hash}, serving the current certificate: {e:#}");
+                self.refresh_backoff.insert(hash.to_owned(), ()).await;
+                Ok(old)
+            }
+            (Err(e), None) => Err(e),
+        }
     }
 
     async fn issue(&self, hash: &str) -> Result<Bytes> {
@@ -233,12 +268,13 @@ mod tests {
         let cfg = Config {
             base_domain: "klapz.direct".into(),
             wildcard: true,
-            directory_url: String::new(),
+            directory_url: "http://127.0.0.1:1/directory".into(), // unreachable on purpose
             email: None,
             data_dir: dir.to_owned(),
             renew_before: Duration::from_secs(30 * 86_400),
             propagation_delay: Duration::ZERO,
             cache_max_bytes: 50_000_000,
+            token_length: 32,
         };
         AppState::new(cfg, Hasher::new(b"secret", 20), None)
     }
@@ -270,6 +306,35 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["certificate"], "CHAIN");
         assert_eq!(json["names"][0], format!("*.{hash}.klapz.direct"));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_serves_current_certificate() {
+        let dir = std::env::temp_dir().join(format!("kdd-refresh-{}", std::process::id()));
+        let st = state(&dir);
+        let hash = st.hasher.subdomain("my-token");
+        // Valid for 5 more days: inside the 30-day renewal window, so a refresh is attempted.
+        // ACME is unreachable in tests, so the refresh fails.
+        let rec = Record {
+            txt: vec![],
+            cert: Some(CertData { not_after: now() + 5 * 86_400, chain: "OLD".into(), key: "KEY".into() }),
+        };
+        st.save(&hash, rec).await.unwrap();
+
+        let json: serde_json::Value = serde_json::from_slice(&st.certificate(&hash).await.unwrap()).unwrap();
+        assert_eq!(json["certificate"], "OLD");
+        assert!(st.refresh_backoff.contains_key(&hash));
+        // Second call: within the backoff, no new attempt, same body.
+        let json: serde_json::Value = serde_json::from_slice(&st.certificate(&hash).await.unwrap()).unwrap();
+        assert_eq!(json["certificate"], "OLD");
+
+        // Expired certificate: no fallback, the error is returned.
+        let other = st.hasher.subdomain("other-token");
+        let rec = Record { txt: vec![], cert: Some(CertData { not_after: now() - 1, chain: "X".into(), key: "K".into() }) };
+        st.save(&other, rec).await.unwrap();
+        assert!(st.certificate(&other).await.is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
     }

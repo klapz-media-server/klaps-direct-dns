@@ -37,6 +37,10 @@ async fn main() -> Result<()> {
         "staging" => instant_acme::LetsEncrypt::Staging.url().to_owned(),
         other => other.to_owned(), // URL of another ACME server
     };
+    anyhow::ensure!(
+        directory_url.starts_with("https://") || directory_url.starts_with("http://"),
+        "ACME_DIRECTORY must be staging, production or an http(s) URL"
+    );
 
     // Cloudflare is optional: without it, the built-in DNS server serves the TXT records
     // straight from memory, with no propagation delay.
@@ -55,7 +59,9 @@ async fn main() -> Result<()> {
         renew_before: Duration::from_secs(env_or("RENEW_BEFORE_DAYS", "30").parse::<u64>()? * 86_400),
         propagation_delay: Duration::from_secs(env_or("DNS_PROPAGATION_SECONDS", default_delay).parse()?),
         cache_max_bytes: env_or("CACHE_MAX_MB", "50").parse::<u64>()? * 1_000_000,
+        token_length: env_or("TOKEN_LENGTH", "32").parse().context("invalid TOKEN_LENGTH")?,
     };
+    anyhow::ensure!(cfg.token_length > 0, "TOKEN_LENGTH must be greater than 0");
     let hasher = Hasher::new(env("HASH_SECRET")?.as_bytes(), env_or("HASH_LENGTH", "20").parse()?);
 
     info!("ACME: {} | Cloudflare: {}", cfg.directory_url, if cloudflare.is_some() { "yes" } else { "no" });
